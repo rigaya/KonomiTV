@@ -588,6 +588,15 @@ class VideoEncodingTask:
             self._encoder_process = None
             Logging.debug_simple(f'[Video: {self.video_stream.video_stream_id}] Terminated {ENCODER_TYPE} process.')
 
+    def packetInSegment(self, pes_header: PES, isVideo: bool, segment: VideoStreamSegment) -> bool:
+        if isVideo:
+            current_dts = pes_header.dts() if pes_header.has_dts() else pes_header.pts()
+            assert current_dts is not None
+            return segment.start_dts <= current_dts <= segment.end_dts
+
+        current_pts = pes_header.pts()
+        assert current_pts is not None
+        return segment.start_pts <= current_pts <= segment.end_pts
 
     def __run(self, first_segment_index: int) -> None:
         """
@@ -958,7 +967,7 @@ class VideoEncodingTask:
                             assert current_pts is not None
 
                             # PTS がレンジ内にあれば
-                            if segment.start_pts <= current_pts <= segment.end_pts:
+                            if self.packetInSegment(pes_header, PID == VIDEO_PID, segment):
 
                                 # この時点で前のセグメントのエンコードが終わっておらず、かつ現在の PTS が切り出し終了 PTS から 3 秒以上が経過している場合、
                                 # もう前のセグメントに該当するパケットは降ってこないだろうと判断し、もう投入するパケットがないことをエンコーダーに通知する
@@ -1059,7 +1068,7 @@ class VideoEncodingTask:
                             assert current_pts is not None
 
                             # PTS がレンジ内にあれば
-                            if segment.start_pts <= current_pts <= segment.end_pts:
+                            if self.packetInSegment(latest_pes_headers[PID], PID == VIDEO_PID, segment):
 
                                 # 当該セグメントのエンコードがすでに完了している場合は何もしない
                                 ## 中間に数個だけ既にエンコードされているセグメントがあるケースでは、
