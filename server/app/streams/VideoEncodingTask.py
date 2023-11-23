@@ -1080,6 +1080,19 @@ class VideoEncodingTask:
                                 ## セグメント間で PTS レンジが重複することはないので、最初に一致したセグメントの Queue だけ処理すればよい
                                 segment.segment_ts_packet_queue.put(ts_packet)
                                 break
+                    
+                    # PCR も適切なセグメントに投入する
+                    elif PID == PCR_PID and ts.has_pcr(ts_packet):
+                        pcr_value = cast(int, ts.pcr(ts_packet))
+
+                        # 開始 PTS 〜 終了 PTS のレンジに一致するセグメントが持つ Queue に TS パケットを投入する
+                        for segment in self.video_stream.segments[first_segment_index:]:
+
+                            # PCR がレンジ内にあれば
+                            if segment.start_pts <= pcr_value <= segment.end_pts:
+
+                                segment.segment_ts_packet_queue.put(ts_packet)
+                                break
 
                     # PSI/SI などのセクションパケットの場合
                     ## PAT / PMT は別途投入済みなのでここには含まれない
