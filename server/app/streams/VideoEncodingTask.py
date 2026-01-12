@@ -17,6 +17,7 @@ from biim.mpeg2ts.parser import PESParser, SectionParser
 from biim.mpeg2ts.pat import PATSection
 from biim.mpeg2ts.pes import PES
 from biim.mpeg2ts.pmt import PMTSection
+from biim.mpeg2ts.section import Section
 
 from app import logging
 from app.config import Config
@@ -352,6 +353,65 @@ class VideoEncodingTask:
 
         return result
 
+    @staticmethod
+    def allocateUnusedPid(used_pids: set[int]) -> int:
+        """ 既存 PID と衝突しない PID を 1 つ確保する """
+        # PID 0x1FFF は NULL パケット用の予約 PID
+        used_pids.add(0x1FFF)
+        # 通常使われにくい高い PID から探す
+        for pid_candidate in range(0x1FFE, 0x0010, -1):
+            if pid_candidate not in used_pids:
+                return pid_candidate
+        raise RuntimeError('Failed to allocate an unused PID for PCR separation.')
+
+    @staticmethod
+    def packPcrbaseToByte(pcr_base: int) -> bytes:
+        """ PCR base (33bit) を TS の PCR 6byte 形式へ変換する """
+        # PCR: base(33) + reserved(6: 0b111111) + extension(9)
+        # extension は 0 固定
+        value = ((pcr_base & 0x1FFFFFFFF) << 15) | (0x3F << 9)
+        return value.to_bytes(6, 'big')
+
+    @staticmethod
+    def replacePmtPcrPid(pmt: PMTSection, new_pcr_pid: int) -> PMTSection:
+        """ PMT の PCR_PID を差し替え、CRC を更新した PMTSection を生成する """
+
+        # payload の該当箇所と CRC を更新した新しい PMTSection を作る
+        payload = bytearray(bytes(pmt.payload))
+        payload[Section.EXTENDED_HEADER_SIZE + 0] = (payload[Section.EXTENDED_HEADER_SIZE + 0] & 0xE0) | ((new_pcr_pid >> 8) & 0x1F)
+        payload[Section.EXTENDED_HEADER_SIZE + 1] = new_pcr_pid & 0xFF
+
+        # CRC フィールド (末尾 4byte) を更新する
+        ## biim の Section.CRC32() は “payload 全体(=CRC フィールド込み) を計算した結果” を返す
+        ## そのため、CRC を作る場合は「CRC フィールドを除いた payload に対する CRC32 値」を末尾 4byte に格納する
+        ## これにより、完成したセクションの CRC32() が 0 になる
+        crc = Section(bytes(payload[:-4])).CRC32()
+        payload[-4:] = crc.to_bytes(4, 'big')
+
+        rebuilt = PMTSection(bytes(payload))
+        rebuilt.PCR_PID = new_pcr_pid
+        # 念のため CRC が正しいことを保証する
+        assert rebuilt.CRC32() == 0
+        return rebuilt
+
+    @staticmethod
+    def buildPcrPacket(pid: int, pcr_bytes: bytes, continuity_counter: int) -> bytes:
+        """ PCR のみを含む TS パケット (Adaptation Field only) を生成する """
+
+        assert len(pcr_bytes) == 6
+
+        packet = bytearray(ts.PACKET_SIZE)
+        packet[0] = ts.SYNC_BYTE[0]
+        packet[1] = (pid >> 8) & 0x1F  # TEI/PUSI/priority は 0
+        packet[2] = pid & 0xFF
+        packet[3] = 0x20 | (continuity_counter & 0x0F)  # adaptation_field_control=2
+
+        # adaptation_field_length はパケット末尾まで含める必要がある (payload なし)
+        packet[4] = ts.PACKET_SIZE - ts.HEADER_SIZE - 1  # 183
+        packet[5] = 0x10  # PCR_flag
+        packet[6:12] = pcr_bytes
+        packet[12:] = b'\xFF' * (ts.PACKET_SIZE - 12)
+        return bytes(packet)
 
     async def run(self, start_sequence: int) -> None:
         """
@@ -413,6 +473,12 @@ class VideoEncodingTask:
                 video_cc: int = 0
                 audio_pid: int | None = None
                 audio_cc: int = 0
+                # PCR PID 分離用
+                ## 映像 PID と PCR PID が一致している場合、PCR 専用 PID を別途作成し PMT の PCR_PID を差し替える
+                ## さらに、元の PCR が来たタイミングで PCR パケットを新 PID で複製送出する
+                pcr_pid_original: int | None = None
+                pcr_pid_remapped: int | None = None
+                pcr_cc: int = 0
 
                 # 録画ファイルが MPEG-4 形式の場合、psisimux で MPEG-TS に変換し、
                 # TS ファイル入力の代わりに psisimux からの出力を tsreadex への入力として渡す
@@ -788,6 +854,20 @@ class VideoEncodingTask:
                     # PID を取得
                     pid = ts.pid(packet)
 
+                    # PCR PID を分離している場合、元の PCR が来たタイミングで PCR 専用パケットを新 PID で複製送出する
+                    ## PCR PID と映像 PID が一致していると、PCR を含む TS パケットが映像 PES の処理に吸収されやすい
+                    ## そこで PMT 上の PCR_PID を別 PID に変更し、PCR のみの TS パケットを生成して流す
+                    if pcr_pid_original is not None and pcr_pid_remapped is not None and pid == pcr_pid_original:
+                        if ts.has_pcr(packet):
+                            pcr_base = ts.pcr(packet)
+                            if pcr_base is not None:
+                                encoded_segment += self.buildPcrPacket(
+                                    pcr_pid_remapped,
+                                    self.packPcrbaseToByte(pcr_base),
+                                    pcr_cc,
+                                )
+                            pcr_cc = (pcr_cc + 1) & 0x0F
+
                     # PAT (Program Association Table)
                     if pid == 0x00:
                         pat_parser.push(packet)
@@ -833,8 +913,28 @@ class VideoEncodingTask:
                                     if audio_pid is None:
                                         audio_pid = elementary_pid
                                         logging.debug(f'{self.video_stream.log_prefix} AAC PID: 0x{elementary_pid:04x}')
+
+                            # PCR PID と映像 PID が一致している場合のみ、PCR 専用 PID を確保して PMT を再構築する
+                            pmt_for_output = pmt
+                            if video_pid is not None and pmt.PCR_PID == video_pid:
+                                if pcr_pid_remapped is None:
+                                    used_pids: set[int] = {0x0000, cast(int, pmt_pid), pmt.PCR_PID}
+                                    for _, elementary_pid, _ in pmt:
+                                        used_pids.add(elementary_pid)
+                                    pcr_pid_original = video_pid
+                                    pcr_pid_remapped = self.allocateUnusedPid(used_pids)
+                                    logging.info(
+                                        f'{self.video_stream.log_prefix} Separated PCR PID '
+                                        f'(0x{pcr_pid_original:04x} -> 0x{pcr_pid_remapped:04x}).'
+                                    )
+
+                                # エンコーダー出力の PMT をそのまま出すと PCR_PID が古いままになるため、
+                                # PMT が来るたびに PCR_PID を差し替えたものを出力する
+                                pmt_for_output = self.replacePmtPcrPid(pmt, cast(int, pcr_pid_remapped))
+                                latest_pmt = pmt_for_output
+
                             # PMT を再構築して candidate に追加
-                            for packet in packetize_section(pmt, False, False, cast(int, pmt_pid), 0, pmt_cc):
+                            for packet in packetize_section(pmt_for_output, False, False, cast(int, pmt_pid), 0, pmt_cc):
                                 encoded_segment += packet
                                 pmt_cc = (pmt_cc + 1) & 0x0F
 
